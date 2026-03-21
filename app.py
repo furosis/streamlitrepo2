@@ -209,7 +209,7 @@ with st.sidebar:
     with st.form("transaction_form", clear_on_submit=True):
         trade_date = st.date_input("Data", value=date.today())
         ticker = st.text_input("Ticker", value="AAPL")
-        transaction_type = st.selectbox("Typ transakcji", ["buy", "sell"])
+        transaction_type = st.selectbox("Typ transakcji", ["kup", "sprzedaj"])
         quantity = st.number_input("Liczba akcji", min_value=0.0, value=1.0, step=1.0)
         price = st.number_input("Cena za akcję", min_value=0.0, value=100.0, step=0.01)
         fee = st.number_input("Prowizja", min_value=0.0, value=0.0, step=0.01)
@@ -322,21 +322,3 @@ else:
         if st.button("Usuń wskazany rekord"):
             delete_transaction(delete_id)
             st.success("Rekord został usunięty. Odśwież widok jeśli trzeba.")
-
-st.divider()
-with st.expander("Jak uruchomić lokalnie i wrzucić na Streamlit Cloud"):
-    st.code(
-        """
-python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\\Scripts\\activate
-pip install -r requirements.txt
-streamlit run app.py
-        """.strip(),
-        language="bash",
-    )
-    st.markdown(
-        "1. Wrzuć pliki `app.py` i `requirements.txt` do repozytorium GitHub.\n"
-        "2. Wejdź na Streamlit Cloud.\n"
-        "3. Wskaż repozytorium i plik startowy `app.py`.\n"
-        "4. Kliknij **Deploy**."
-    )
