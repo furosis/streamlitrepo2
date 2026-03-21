@@ -202,7 +202,7 @@ def comparison_chart(tickers: list[str], period: str):
 
 
 st.title("📈 Aplikacja wspomagająca inwestycje giełdowe")
-st.caption("Streamlit + yfinance + Plotly + SQLite")
+st.caption("")
 
 with st.sidebar:
     st.header("Dodaj transakcję")
