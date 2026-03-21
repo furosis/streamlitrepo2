@@ -76,13 +76,11 @@ def insert_transaction(trade_date, ticker, transaction_type, quantity, price, fe
     conn.close()
 
 
-
 def delete_transaction(row_id: int):
     conn = get_connection()
     conn.execute("DELETE FROM transactions WHERE id = ?", (int(row_id),))
     conn.commit()
     conn.close()
-
 
 
 def import_csv(df: pd.DataFrame):
@@ -104,7 +102,6 @@ def import_csv(df: pd.DataFrame):
             row["price"],
             row.get("fee", 0),
         )
-
 
 
 def calculate_portfolio(transactions: pd.DataFrame) -> pd.DataFrame:
@@ -161,7 +158,6 @@ def calculate_portfolio(transactions: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-
 def portfolio_chart(history_df: pd.DataFrame, ticker: str):
     fig = go.Figure()
     fig.add_trace(
@@ -181,6 +177,32 @@ def portfolio_chart(history_df: pd.DataFrame, ticker: str):
     )
     return fig
 
+
+def example_monthly_returns_chart():
+    dates = pd.date_range("2025-01-01", periods=6, freq="MS")
+    returns = [2.4, -1.1, 3.8, 1.6, -0.7, 4.2]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=dates, y=returns, name="Stopa zwrotu [%]"))
+    fig.update_layout(
+        title="Miesięczna stopa zwrotu portfela",
+        xaxis_title="Miesiąc",
+        yaxis_title="Stopa zwrotu [%]",
+        height=420,
+        margin=dict(l=20, r=20, t=50, b=20),
+    )
+    return fig
+
+
+def example_allocation_chart():
+    labels = ["AAPL", "MSFT", "NVDA", "ETF S&P 500"]
+    values = [3200, 2600, 1800, 2400]
+    fig = go.Figure(data=[go.Pie(labels=labels, values=values, hole=0.45)])
+    fig.update_layout(
+        title="Struktura przykładowego portfela",
+        height=420,
+        margin=dict(l=20, r=20, t=50, b=20),
+    )
+    return fig
 
 
 def comparison_chart(tickers: list[str], period: str):
@@ -202,14 +224,13 @@ def comparison_chart(tickers: list[str], period: str):
 
 
 st.title("📈 Aplikacja wspomagająca inwestycje giełdowe")
-st.caption("")
 
 with st.sidebar:
     st.header("Dodaj transakcję")
     with st.form("transaction_form", clear_on_submit=True):
         trade_date = st.date_input("Data", value=date.today())
         ticker = st.text_input("Ticker", value="AAPL")
-        transaction_type = st.selectbox("Typ transakcji", ["kup", "sprzedaj"])
+        transaction_type = st.selectbox("Typ transakcji", ["buy", "sell"])
         quantity = st.number_input("Liczba akcji", min_value=0.0, value=1.0, step=1.0)
         price = st.number_input("Cena za akcję", min_value=0.0, value=100.0, step=0.01)
         fee = st.number_input("Prowizja", min_value=0.0, value=0.0, step=0.01)
@@ -261,11 +282,12 @@ else:
     c3.metric("Łączny P/L", f"{total_pl:,.2f}")
     c4.metric("Najbardziej opłacalna spółka", best_ticker)
 
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "Portfel",
         "Analiza spółki",
         "Porównanie spółek",
         "Historia transakcji",
+        "Przykłady z grafami",
     ])
 
     with tab1:
@@ -279,8 +301,18 @@ else:
         st.subheader("Kalkulator sprzedaży")
         selected_ticker = st.selectbox("Wybierz ticker", portfolio["Ticker"].tolist())
         selected_row = portfolio[portfolio["Ticker"] == selected_ticker].iloc[0]
-        target_price = st.number_input("Założona cena sprzedaży", min_value=0.0, value=float(selected_row["Aktualny kurs"]) if pd.notna(selected_row["Aktualny kurs"]) else 100.0, step=0.01)
-        quantity_to_sell = st.number_input("Liczba akcji do sprzedaży", min_value=0.0, value=float(max(selected_row["Aktualnie [szt.]"], 0.0)), step=1.0)
+        target_price = st.number_input(
+            "Założona cena sprzedaży",
+            min_value=0.0,
+            value=float(selected_row["Aktualny kurs"]) if pd.notna(selected_row["Aktualny kurs"]) else 100.0,
+            step=0.01
+        )
+        quantity_to_sell = st.number_input(
+            "Liczba akcji do sprzedaży",
+            min_value=0.0,
+            value=float(max(selected_row["Aktualnie [szt.]"], 0.0)),
+            step=1.0
+        )
         estimated_pl = (target_price - selected_row["Średnia cena zakupu"]) * quantity_to_sell
         st.metric("Szacowany zysk/strata", f"{estimated_pl:,.2f}")
 
@@ -309,7 +341,12 @@ else:
             sorted(transactions["ticker"].unique().tolist()),
             default=sorted(transactions["ticker"].unique().tolist())[:3],
         )
-        compare_period = st.selectbox("Zakres porównania", ["1mo", "3mo", "6mo", "1y", "2y", "5y"], index=3, key="compare_period")
+        compare_period = st.selectbox(
+            "Zakres porównania",
+            ["1mo", "3mo", "6mo", "1y", "2y", "5y"],
+            index=3,
+            key="compare_period"
+        )
         if compare_tickers:
             st.plotly_chart(comparison_chart(compare_tickers, compare_period), use_container_width=True)
         else:
@@ -322,3 +359,15 @@ else:
         if st.button("Usuń wskazany rekord"):
             delete_transaction(delete_id)
             st.success("Rekord został usunięty. Odśwież widok jeśli trzeba.")
+
+    with tab5:
+        st.subheader("Grafy:")
+
+        e1, e2 = st.columns(2)
+        with e1:
+            st.plotly_chart(example_monthly_returns_chart(), use_container_width=True)
+            st.caption("Przykład analizy zmian wartości portfela miesiąc do miesiąca.")
+
+        with e2:
+            st.plotly_chart(example_allocation_chart(), use_container_width=True)
+            st.caption("Przykład prezentacji udziału poszczególnych aktywów w portfelu.")
