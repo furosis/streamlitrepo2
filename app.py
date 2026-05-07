@@ -14,6 +14,7 @@ import yfinance as yf
 
 DB_PATH = Path("portfolio.db")
 
+
 st.set_page_config(
     page_title="Aplikacja wspomagająca inwestycje giełdowe",
     page_icon="📈",
@@ -47,7 +48,7 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
+            user_id INTEGER NOT NULL,
             trade_date TEXT NOT NULL,
             ticker TEXT NOT NULL,
             transaction_type TEXT NOT NULL,
@@ -69,11 +70,6 @@ def init_db():
         )
         """
     )
-
-    # Migracja na wypadek, gdyby wcześniej istniała tabela bez user_id
-    columns = pd.read_sql_query("PRAGMA table_info(transactions)", conn)
-    if "user_id" not in columns["name"].tolist():
-        conn.execute("ALTER TABLE transactions ADD COLUMN user_id INTEGER DEFAULT 1")
 
     conn.commit()
     conn.close()
@@ -157,7 +153,11 @@ def login_user(username: str, password: str):
     conn = get_connection()
 
     row = conn.execute(
-        "SELECT id, username, password_hash FROM users WHERE username = ?",
+        """
+        SELECT id, username, password_hash
+        FROM users
+        WHERE username = ?
+        """,
         (username,),
     ).fetchone()
 
@@ -177,13 +177,35 @@ def login_user(username: str, password: str):
     return None
 
 
+def delete_account(user_id: int):
+    conn = get_connection()
+
+    conn.execute(
+        "DELETE FROM transactions WHERE user_id = ?",
+        (int(user_id),),
+    )
+
+    conn.execute(
+        "DELETE FROM reports WHERE user_id = ?",
+        (int(user_id),),
+    )
+
+    conn.execute(
+        "DELETE FROM users WHERE id = ?",
+        (int(user_id),),
+    )
+
+    conn.commit()
+    conn.close()
+
+
 def show_login_screen():
     st.title("📈 Aplikacja wspomagająca inwestycje giełdowe")
     st.caption(
-        "System analityczny do obsługi portfela inwestycyjnego, transakcji, raportów i wykresów."
+        "System do zapisu transakcji, analizy portfela, generowania raportów i prezentacji wykresów."
     )
 
-    left, right = st.columns([1, 1])
+    left, right = st.columns(2)
 
     with left:
         st.subheader("Logowanie")
@@ -217,7 +239,7 @@ def show_login_screen():
             if submitted:
                 try:
                     register_user(new_username, new_password)
-                    st.success("Konto zostało utworzone. Możesz się teraz zalogować.")
+                    st.success("Konto zostało utworzone. Możesz się zalogować.")
                 except Exception as exc:
                     st.error(str(exc))
 
@@ -237,7 +259,6 @@ def show_login_screen():
 def load_price_history(ticker: str, period: str = "1y") -> pd.DataFrame:
     """
     Pobiera dane historyczne z Yahoo Finance za pomocą biblioteki yfinance.
-    Dane są wykorzystywane do wykresów, porównań oraz wyceny portfela.
     """
 
     try:
@@ -262,6 +283,45 @@ def load_price_history(ticker: str, period: str = "1y") -> pd.DataFrame:
 
     except Exception:
         return pd.DataFrame()
+
+
+@st.cache_data(ttl=300)
+def get_latest_market_price(ticker: str):
+    """
+    Pobiera możliwie aktualną cenę instrumentu z yfinance.
+    Najpierw próbuje pobrać last_price z fast_info,
+    a jeśli to się nie uda, bierze ostatnią cenę Close z historii 5d.
+    """
+
+    ticker = ticker.upper().strip()
+
+    if not ticker:
+        return None, None, None
+
+    try:
+        fast_info = yf.Ticker(ticker).fast_info
+        last_price = fast_info.get("last_price")
+
+        if last_price is not None:
+            return float(last_price), datetime.now(), "fast_info.last_price"
+
+    except Exception:
+        pass
+
+    history = load_price_history(ticker, period="5d")
+
+    if history.empty or "Close" not in history.columns:
+        return None, None, None
+
+    close_series = history["Close"].dropna()
+
+    if close_series.empty:
+        return None, None, None
+
+    latest_price = float(close_series.iloc[-1])
+    latest_date = history["Date"].iloc[-1]
+
+    return latest_price, latest_date, "history.Close"
 
 
 # ==========================================================
@@ -361,7 +421,10 @@ def delete_transaction(user_id: int, row_id: int):
     conn = get_connection()
 
     conn.execute(
-        "DELETE FROM transactions WHERE id = ? AND user_id = ?",
+        """
+        DELETE FROM transactions
+        WHERE id = ? AND user_id = ?
+        """,
         (
             int(row_id),
             int(user_id),
@@ -370,117 +433,6 @@ def delete_transaction(user_id: int, row_id: int):
 
     conn.commit()
     conn.close()
-
-
-def delete_all_transactions(user_id: int):
-    conn = get_connection()
-
-    conn.execute(
-        "DELETE FROM transactions WHERE user_id = ?",
-        (int(user_id),),
-    )
-
-    conn.commit()
-    conn.close()
-
-
-def import_csv_transactions(user_id: int, df: pd.DataFrame):
-    required = {
-        "trade_date",
-        "ticker",
-        "transaction_type",
-        "quantity",
-        "price",
-        "fee",
-    }
-
-    if not required.issubset(df.columns):
-        raise ValueError(f"CSV musi zawierać kolumny: {', '.join(sorted(required))}")
-
-    clean = df.copy()
-
-    clean["trade_date"] = pd.to_datetime(clean["trade_date"]).dt.date
-    clean["ticker"] = clean["ticker"].astype(str).str.upper().str.strip()
-    clean["transaction_type"] = clean["transaction_type"].apply(normalize_transaction_type)
-    clean["quantity"] = pd.to_numeric(clean["quantity"])
-    clean["price"] = pd.to_numeric(clean["price"])
-    clean["fee"] = pd.to_numeric(clean["fee"]).fillna(0)
-
-    added = 0
-
-    for _, row in clean.iterrows():
-        insert_transaction(
-            user_id=user_id,
-            trade_date=row["trade_date"],
-            ticker=row["ticker"],
-            transaction_type=row["transaction_type"],
-            quantity=row["quantity"],
-            price=row["price"],
-            fee=row["fee"],
-        )
-
-        added += 1
-
-    return added
-
-
-# ==========================================================
-# WIĘKSZA PRZYKŁADOWA BAZA TRANSAKCJI
-# ==========================================================
-
-DEMO_TRANSACTIONS = [
-    ("2025-01-08", "AAPL", "buy", 10, 182.40, 1.99),
-    ("2025-01-14", "MSFT", "buy", 6, 404.20, 1.99),
-    ("2025-01-22", "NVDA", "buy", 12, 118.60, 1.99),
-    ("2025-02-03", "GOOGL", "buy", 8, 144.30, 1.99),
-    ("2025-02-10", "AMZN", "buy", 7, 168.50, 1.99),
-    ("2025-02-19", "META", "buy", 4, 486.10, 1.99),
-    ("2025-03-04", "TSLA", "buy", 5, 201.80, 1.99),
-    ("2025-03-11", "AAPL", "buy", 5, 175.20, 1.99),
-    ("2025-03-18", "MSFT", "buy", 2, 389.70, 1.99),
-    ("2025-03-27", "NVDA", "sell", 4, 126.40, 1.99),
-    ("2025-04-02", "PKO.WA", "buy", 30, 59.20, 3.50),
-    ("2025-04-09", "PKN.WA", "buy", 20, 66.40, 3.50),
-    ("2025-04-17", "CDR.WA", "buy", 12, 118.30, 3.50),
-    ("2025-05-06", "AAPL", "sell", 3, 194.10, 1.99),
-    ("2025-05-13", "GOOGL", "buy", 4, 151.20, 1.99),
-    ("2025-05-21", "AMZN", "sell", 2, 181.90, 1.99),
-    ("2025-06-03", "META", "buy", 2, 502.30, 1.99),
-    ("2025-06-17", "TSLA", "buy", 4, 184.60, 1.99),
-    ("2025-07-01", "NVDA", "buy", 8, 132.70, 1.99),
-    ("2025-07-15", "MSFT", "sell", 2, 425.50, 1.99),
-    ("2025-08-05", "PKO.WA", "buy", 20, 61.10, 3.50),
-    ("2025-08-19", "PKN.WA", "sell", 5, 70.20, 3.50),
-    ("2025-09-02", "CDR.WA", "buy", 6, 126.80, 3.50),
-    ("2025-09-16", "AAPL", "buy", 4, 203.40, 1.99),
-    ("2025-10-01", "GOOGL", "sell", 3, 164.20, 1.99),
-    ("2025-10-15", "AMZN", "buy", 5, 187.30, 1.99),
-    ("2025-11-03", "META", "sell", 1, 548.60, 1.99),
-    ("2025-11-18", "TSLA", "sell", 3, 231.20, 1.99),
-    ("2025-12-04", "NVDA", "buy", 6, 141.90, 1.99),
-    ("2025-12-17", "MSFT", "buy", 3, 438.40, 1.99),
-    ("2026-01-09", "PKO.WA", "sell", 15, 66.80, 3.50),
-    ("2026-01-21", "PKN.WA", "buy", 10, 73.10, 3.50),
-    ("2026-02-04", "CDR.WA", "sell", 5, 139.40, 3.50),
-    ("2026-02-18", "AAPL", "buy", 3, 211.60, 1.99),
-    ("2026-03-05", "NVDA", "sell", 5, 155.20, 1.99),
-    ("2026-03-19", "AMZN", "sell", 4, 198.70, 1.99),
-    ("2026-04-02", "GOOGL", "buy", 5, 172.40, 1.99),
-    ("2026-04-16", "META", "buy", 2, 566.30, 1.99),
-]
-
-
-def load_demo_transactions(user_id: int):
-    for item in DEMO_TRANSACTIONS:
-        insert_transaction(
-            user_id=user_id,
-            trade_date=item[0],
-            ticker=item[1],
-            transaction_type=item[2],
-            quantity=item[3],
-            price=item[4],
-            fee=item[5],
-        )
 
 
 # ==========================================================
@@ -507,14 +459,18 @@ def calculate_portfolio(transactions: pd.DataFrame) -> pd.DataFrame:
         gross_sell_value = (sells["quantity"] * sells["price"]).sum()
         sell_fees = sells["fee"].sum()
 
-        avg_buy_price = (gross_buy_value + buy_fees) / bought_qty if bought_qty > 0 else 0
+        avg_buy_price = (
+            (gross_buy_value + buy_fees) / bought_qty
+            if bought_qty > 0
+            else 0
+        )
 
         realized_pl = gross_sell_value - sell_fees - (avg_buy_price * sold_qty)
 
-        history = load_price_history(ticker, period="5d")
+        latest_price, latest_date, source = get_latest_market_price(ticker)
 
-        if not history.empty and "Close" in history.columns:
-            market_price = float(history["Close"].iloc[-1])
+        if latest_price is not None:
+            market_price = latest_price
             market_value = current_qty * market_price
             unrealized_pl = market_value - (current_qty * avg_buy_price)
             total_pl = realized_pl + unrealized_pl
@@ -530,6 +486,7 @@ def calculate_portfolio(transactions: pd.DataFrame) -> pd.DataFrame:
             unrealized_pl = np.nan
             total_pl = realized_pl
             profit_percent = np.nan
+            latest_date = None
 
         rows.append(
             {
@@ -542,6 +499,7 @@ def calculate_portfolio(transactions: pd.DataFrame) -> pd.DataFrame:
                 "Przychód ze sprzedaży": gross_sell_value - sell_fees,
                 "Zrealizowany P/L": realized_pl,
                 "Aktualny kurs": market_price,
+                "Data kursu": latest_date,
                 "Wartość rynkowa": market_value,
                 "Niezrealizowany P/L": unrealized_pl,
                 "Łączny P/L": total_pl,
@@ -564,7 +522,7 @@ def price_chart(history_df: pd.DataFrame, ticker: str):
             x=history_df["Date"],
             y=history_df["Close"],
             mode="lines",
-            name="Cena zamknięcia",
+            name="Cena",
         )
     )
 
@@ -768,15 +726,16 @@ user_id = st.session_state["user_id"]
 username = st.session_state["username"]
 
 st.title("📈 Aplikacja wspomagająca inwestycje giełdowe")
-st.caption(f"Zalogowany użytkownik: **{username}**")
+
+
+# ==========================================================
+# PANEL UŻYTKOWNIKA
+# ==========================================================
 
 with st.sidebar:
     st.header("Panel użytkownika")
-
-    st.info(
-        "Aplikacja pobiera dane rynkowe online za pomocą biblioteki yfinance. "
-        "Dane z innych źródeł, np. analizy.pl, mogą być wprowadzane przez plik CSV."
-    )
+    st.write(f"Zalogowano jako:")
+    st.subheader(username)
 
     if st.button("Wyloguj"):
         st.session_state.clear()
@@ -784,15 +743,269 @@ with st.sidebar:
 
     st.divider()
 
-    st.header("Dodaj transakcję")
+    st.subheader("Usuń konto")
 
-    with st.form("transaction_form", clear_on_submit=True):
-        trade_date = st.date_input("Data transakcji", value=date.today())
-        ticker = st.text_input("Ticker", value="AAPL")
-        transaction_type = st.selectbox("Typ transakcji", ["buy", "sell"])
-        quantity = st.number_input("Liczba akcji", min_value=0.0, value=1.0, step=1.0)
-        price = st.number_input("Cena za akcję", min_value=0.0, value=100.0, step=0.01)
-        fee = st.number_input("Prowizja", min_value=0.0, value=0.0, step=0.01)
+    confirm_delete = st.checkbox(
+        "Potwierdzam usunięcie konta i wszystkich moich danych"
+    )
+
+    if st.button("Usuń konto"):
+        if confirm_delete:
+            delete_account(user_id)
+            st.session_state.clear()
+            st.success("Konto zostało usunięte.")
+            st.rerun()
+        else:
+            st.warning("Najpierw zaznacz potwierdzenie usunięcia konta.")
+
+
+transactions = read_transactions(user_id)
+portfolio = calculate_portfolio(transactions)
+
+
+# ==========================================================
+# METRYKI GÓRNE
+# ==========================================================
+
+if transactions.empty:
+    st.info("Nie masz jeszcze żadnych transakcji. Przejdź do zakładki „Dodaj transakcję”.")
+else:
+    total_cost = portfolio["Koszt zakupu"].sum() if not portfolio.empty else 0
+    total_market_value = np.nansum(portfolio["Wartość rynkowa"]) if not portfolio.empty else 0
+    total_pl = np.nansum(portfolio["Łączny P/L"]) if not portfolio.empty else 0
+    best_ticker = portfolio.iloc[0]["Ticker"] if not portfolio.empty else "-"
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric("Łączny koszt zakupu", f"{total_cost:,.2f}")
+    c2.metric("Aktualna wartość", f"{total_market_value:,.2f}")
+    c3.metric("Łączny P/L", f"{total_pl:,.2f}")
+    c4.metric("Najbardziej opłacalna spółka", best_ticker)
+
+
+# ==========================================================
+# ZAKŁADKI
+# ==========================================================
+
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+    [
+        "Portfel",
+        "Dodaj transakcję",
+        "Analiza spółki",
+        "Porównanie spółek",
+        "Historia transakcji",
+        "Raporty",
+        "Eksport i informacje",
+    ]
+)
+
+
+# ==========================================================
+# TAB 1 — PORTFEL
+# ==========================================================
+
+with tab1:
+    st.subheader("Podsumowanie portfela")
+
+    if transactions.empty:
+        st.info("Brak danych do wyświetlenia. Dodaj pierwszą transakcję.")
+    else:
+        display_cols = [
+            "Ticker",
+            "Kupiono [szt.]",
+            "Sprzedano [szt.]",
+            "Aktualnie [szt.]",
+            "Średnia cena zakupu",
+            "Aktualny kurs",
+            "Data kursu",
+            "Wartość rynkowa",
+            "Łączny P/L",
+            "Stopa zwrotu [%]",
+        ]
+
+        st.dataframe(
+            portfolio[display_cols],
+            use_container_width=True,
+        )
+
+        chart_col1, chart_col2 = st.columns(2)
+
+        with chart_col1:
+            st.plotly_chart(
+                profit_chart(portfolio),
+                use_container_width=True,
+            )
+
+        with chart_col2:
+            fig = allocation_chart(portfolio)
+
+            if fig:
+                st.plotly_chart(
+                    fig,
+                    use_container_width=True,
+                )
+            else:
+                st.info("Brak aktywnych pozycji do pokazania struktury portfela.")
+
+        st.subheader("Ranking opłacalności")
+
+        ranking = portfolio[
+            [
+                "Ticker",
+                "Łączny P/L",
+                "Stopa zwrotu [%]",
+                "Wartość rynkowa",
+            ]
+        ].copy()
+
+        st.dataframe(
+            ranking,
+            use_container_width=True,
+        )
+
+        st.subheader("Kalkulator sprzedaży")
+
+        selected_ticker = st.selectbox(
+            "Wybierz ticker",
+            portfolio["Ticker"].tolist(),
+        )
+
+        selected_row = portfolio[portfolio["Ticker"] == selected_ticker].iloc[0]
+
+        default_price = (
+            float(selected_row["Aktualny kurs"])
+            if pd.notna(selected_row["Aktualny kurs"])
+            else 100.0
+        )
+
+        target_price = st.number_input(
+            "Założona cena sprzedaży",
+            min_value=0.0,
+            value=default_price,
+            step=0.01,
+        )
+
+        quantity_to_sell = st.number_input(
+            "Liczba akcji do sprzedaży",
+            min_value=0.0,
+            value=float(max(selected_row["Aktualnie [szt.]"], 0.0)),
+            step=1.0,
+        )
+
+        estimated_pl = (
+            target_price - selected_row["Średnia cena zakupu"]
+        ) * quantity_to_sell
+
+        st.metric(
+            "Szacowany zysk/strata",
+            f"{estimated_pl:,.2f}",
+        )
+
+
+# ==========================================================
+# TAB 2 — DODAJ TRANSAKCJĘ
+# ==========================================================
+
+with tab2:
+    st.subheader("Dodaj transakcję")
+
+    st.markdown(
+        """
+        Wpisz ticker spółki, a aplikacja spróbuje automatycznie pobrać ostatni dostępny kurs z `yfinance`.
+        Cenę możesz zostawić automatycznie pobraną albo poprawić ręcznie.
+        """
+    )
+
+    if "transaction_ticker" not in st.session_state:
+        st.session_state["transaction_ticker"] = "AAPL"
+
+    if "transaction_price" not in st.session_state:
+        st.session_state["transaction_price"] = 100.0
+
+    if "last_price_ticker" not in st.session_state:
+        st.session_state["last_price_ticker"] = ""
+
+    ticker_input = st.text_input(
+        "Ticker",
+        key="transaction_ticker",
+        help="Przykłady: AAPL, MSFT, NVDA, TSLA, PKO.WA, CDR.WA",
+    )
+
+    current_ticker = ticker_input.upper().strip()
+
+    if current_ticker and current_ticker != st.session_state["last_price_ticker"]:
+        latest_price, latest_date, source = get_latest_market_price(current_ticker)
+
+        st.session_state["last_price_ticker"] = current_ticker
+
+        if latest_price is not None:
+            st.session_state["transaction_price"] = round(latest_price, 2)
+
+            if latest_date is not None and hasattr(latest_date, "strftime"):
+                date_text = latest_date.strftime("%Y-%m-%d")
+            else:
+                date_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            st.success(
+                f"Pobrano kurs dla {current_ticker}: {latest_price:,.2f} "
+                f"— źródło: {source}, data: {date_text}"
+            )
+        else:
+            st.warning(
+                "Nie udało się pobrać kursu dla tego tickera. "
+                "Sprawdź symbol albo wpisz cenę ręcznie."
+            )
+
+    if st.button("Odśwież cenę z yfinance"):
+        latest_price, latest_date, source = get_latest_market_price(current_ticker)
+
+        if latest_price is not None:
+            st.session_state["transaction_price"] = round(latest_price, 2)
+
+            if latest_date is not None and hasattr(latest_date, "strftime"):
+                date_text = latest_date.strftime("%Y-%m-%d")
+            else:
+                date_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            st.success(
+                f"Zaktualizowano cenę: {latest_price:,.2f} "
+                f"— źródło: {source}, data: {date_text}"
+            )
+        else:
+            st.error("Nie udało się pobrać ceny dla podanego tickera.")
+
+    with st.form("transaction_form", clear_on_submit=False):
+        trade_date = st.date_input(
+            "Data transakcji",
+            value=date.today(),
+        )
+
+        transaction_type = st.selectbox(
+            "Typ transakcji",
+            ["buy", "sell"],
+            format_func=lambda x: "Kupno" if x == "buy" else "Sprzedaż",
+        )
+
+        quantity = st.number_input(
+            "Liczba akcji",
+            min_value=0.0,
+            value=1.0,
+            step=1.0,
+        )
+
+        price = st.number_input(
+            "Cena za akcję",
+            min_value=0.0,
+            step=0.01,
+            key="transaction_price",
+        )
+
+        fee = st.number_input(
+            "Prowizja",
+            min_value=0.0,
+            value=0.0,
+            step=0.01,
+        )
 
         submitted = st.form_submit_button("Zapisz transakcję")
 
@@ -801,7 +1014,7 @@ with st.sidebar:
                 insert_transaction(
                     user_id=user_id,
                     trade_date=trade_date,
-                    ticker=ticker,
+                    ticker=current_ticker,
                     transaction_type=transaction_type,
                     quantity=quantity,
                     price=price,
@@ -814,308 +1027,176 @@ with st.sidebar:
             except Exception as exc:
                 st.error(str(exc))
 
-    st.divider()
-
-    st.header("Import CSV")
-
-    uploaded = st.file_uploader("Wgraj plik CSV z transakcjami", type=["csv"])
-
-    if uploaded is not None:
-        if st.button("Importuj CSV"):
-            try:
-                csv_df = pd.read_csv(uploaded)
-                count = import_csv_transactions(user_id, csv_df)
-
-                st.success(f"Zaimportowano transakcje: {count}")
-                st.rerun()
-
-            except Exception as exc:
-                st.error(str(exc))
-
-    st.markdown(
-        """
-        **Wymagany format CSV:**
-
-        `trade_date,ticker,transaction_type,quantity,price,fee`
-        """
-    )
-
-    st.divider()
-
-    st.header("Dane przykładowe")
-
-    if st.button("Załaduj większą przykładową bazę"):
-        try:
-            load_demo_transactions(user_id)
-
-            st.success("Przykładowa baza została załadowana.")
-            st.rerun()
-
-        except Exception as exc:
-            st.error(str(exc))
-
-    if st.button("Usuń wszystkie moje transakcje"):
-        delete_all_transactions(user_id)
-
-        st.warning("Usunięto wszystkie transakcje użytkownika.")
-        st.rerun()
-
-
-transactions = read_transactions(user_id)
-portfolio = calculate_portfolio(transactions)
-
-
-if transactions.empty:
-    st.info(
-        "Dodaj pierwszą transakcję z panelu po lewej, zaimportuj CSV albo załaduj większą przykładową bazę."
-    )
-    st.stop()
-
 
 # ==========================================================
-# METRYKI GÓRNE
+# TAB 3 — ANALIZA SPÓŁKI
 # ==========================================================
-
-total_cost = portfolio["Koszt zakupu"].sum() if not portfolio.empty else 0
-total_market_value = np.nansum(portfolio["Wartość rynkowa"]) if not portfolio.empty else 0
-total_pl = np.nansum(portfolio["Łączny P/L"]) if not portfolio.empty else 0
-best_ticker = portfolio.iloc[0]["Ticker"] if not portfolio.empty else "-"
-
-c1, c2, c3, c4 = st.columns(4)
-
-c1.metric("Łączny koszt zakupu", f"{total_cost:,.2f}")
-c2.metric("Aktualna wartość", f"{total_market_value:,.2f}")
-c3.metric("Łączny P/L", f"{total_pl:,.2f}")
-c4.metric("Najbardziej opłacalna spółka", best_ticker)
-
-
-# ==========================================================
-# ZAKŁADKI
-# ==========================================================
-
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-    [
-        "Portfel",
-        "Analiza spółki",
-        "Porównanie spółek",
-        "Historia transakcji",
-        "Raporty",
-        "Eksport i informacje",
-    ]
-)
-
-
-with tab1:
-    st.subheader("Podsumowanie portfela")
-
-    display_cols = [
-        "Ticker",
-        "Kupiono [szt.]",
-        "Sprzedano [szt.]",
-        "Aktualnie [szt.]",
-        "Średnia cena zakupu",
-        "Aktualny kurs",
-        "Wartość rynkowa",
-        "Łączny P/L",
-        "Stopa zwrotu [%]",
-    ]
-
-    st.dataframe(portfolio[display_cols], use_container_width=True)
-
-    chart_col1, chart_col2 = st.columns(2)
-
-    with chart_col1:
-        st.plotly_chart(profit_chart(portfolio), use_container_width=True)
-
-    with chart_col2:
-        fig = allocation_chart(portfolio)
-
-        if fig:
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("Brak aktywnych pozycji do pokazania struktury portfela.")
-
-    st.subheader("Ranking opłacalności")
-
-    ranking = portfolio[
-        [
-            "Ticker",
-            "Łączny P/L",
-            "Stopa zwrotu [%]",
-            "Wartość rynkowa",
-        ]
-    ].copy()
-
-    st.dataframe(ranking, use_container_width=True)
-
-    st.subheader("Kalkulator sprzedaży")
-
-    selected_ticker = st.selectbox(
-        "Wybierz ticker",
-        portfolio["Ticker"].tolist(),
-    )
-
-    selected_row = portfolio[portfolio["Ticker"] == selected_ticker].iloc[0]
-
-    target_price = st.number_input(
-        "Założona cena sprzedaży",
-        min_value=0.0,
-        value=float(selected_row["Aktualny kurs"])
-        if pd.notna(selected_row["Aktualny kurs"])
-        else 100.0,
-        step=0.01,
-    )
-
-    quantity_to_sell = st.number_input(
-        "Liczba akcji do sprzedaży",
-        min_value=0.0,
-        value=float(max(selected_row["Aktualnie [szt.]"], 0.0)),
-        step=1.0,
-    )
-
-    estimated_pl = (target_price - selected_row["Średnia cena zakupu"]) * quantity_to_sell
-
-    st.metric("Szacowany zysk/strata", f"{estimated_pl:,.2f}")
-
-
-with tab2:
-    st.subheader("Szczegółowa analiza spółki")
-
-    all_tickers = sorted(transactions["ticker"].unique().tolist())
-
-    ticker_for_analysis = st.selectbox(
-        "Spółka",
-        all_tickers,
-        key="analysis_ticker",
-    )
-
-    period = st.selectbox(
-        "Zakres danych",
-        ["1mo", "3mo", "6mo", "1y", "2y", "5y"],
-        index=3,
-    )
-
-    history = load_price_history(ticker_for_analysis, period=period)
-
-    if history.empty:
-        st.warning("Brak danych dla wybranego tickera. Sprawdź symbol spółki.")
-    else:
-        st.plotly_chart(
-            price_chart(history, ticker_for_analysis),
-            use_container_width=True,
-        )
-
-        close = history["Close"]
-
-        s1, s2, s3, s4 = st.columns(4)
-
-        s1.metric("Średnia cena", f"{close.mean():,.2f}")
-        s2.metric("Minimum", f"{close.min():,.2f}")
-        s3.metric("Maksimum", f"{close.max():,.2f}")
-        s4.metric("Odchylenie standardowe", f"{close.std():,.2f}")
-
-        change = close.iloc[-1] - close.iloc[0]
-        change_percent = change / close.iloc[0] * 100
-
-        st.metric(
-            "Zmiana w analizowanym okresie",
-            f"{change:,.2f}",
-            f"{change_percent:,.2f}%",
-        )
-
 
 with tab3:
-    st.subheader("Porównanie historyczne spółek")
+    st.subheader("Szczegółowa analiza spółki")
 
-    compare_tickers = st.multiselect(
-        "Wybierz tickery",
-        sorted(transactions["ticker"].unique().tolist()),
-        default=sorted(transactions["ticker"].unique().tolist())[:3],
-    )
-
-    compare_period = st.selectbox(
-        "Zakres porównania",
-        ["1mo", "3mo", "6mo", "1y", "2y", "5y"],
-        index=3,
-        key="compare_period",
-    )
-
-    if compare_tickers:
-        st.plotly_chart(
-            comparison_chart(compare_tickers, compare_period),
-            use_container_width=True,
-        )
+    if transactions.empty:
+        st.info("Najpierw dodaj przynajmniej jedną transakcję.")
     else:
-        st.info("Wybierz co najmniej jeden ticker.")
+        all_tickers = sorted(transactions["ticker"].unique().tolist())
 
+        ticker_for_analysis = st.selectbox(
+            "Spółka",
+            all_tickers,
+            key="analysis_ticker",
+        )
 
-with tab4:
-    st.subheader("Historia transakcji")
+        period = st.selectbox(
+            "Zakres danych",
+            ["1mo", "3mo", "6mo", "1y", "2y", "5y"],
+            index=3,
+        )
 
-    show_df = transactions.copy()
+        history = load_price_history(ticker_for_analysis, period=period)
 
-    show_df["transaction_type"] = show_df["transaction_type"].replace(
-        {
-            "buy": "kupno",
-            "sell": "sprzedaż",
-        }
-    )
-
-    st.dataframe(show_df, use_container_width=True)
-
-    st.subheader("Usuwanie transakcji")
-
-    transaction_ids = transactions["id"].tolist()
-
-    selected_id = st.selectbox(
-        "Wybierz ID transakcji do usunięcia",
-        transaction_ids,
-    )
-
-    if st.button("Usuń wybraną transakcję"):
-        delete_transaction(user_id, selected_id)
-
-        st.success("Transakcja została usunięta.")
-        st.rerun()
-
-
-with tab5:
-    st.subheader("Raporty")
-
-    report_content = build_report_text(
-        username=username,
-        portfolio=portfolio,
-        transactions=transactions,
-    )
-
-    st.text_area(
-        "Podgląd raportu",
-        report_content,
-        height=420,
-    )
-
-    col_a, col_b = st.columns(2)
-
-    with col_a:
-        if st.button("Zapisz raport do historii"):
-            title = f"Raport portfela - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-
-            save_report(
-                user_id,
-                title,
-                report_content,
+        if history.empty:
+            st.warning("Brak danych dla wybranego tickera. Sprawdź symbol spółki.")
+        else:
+            st.plotly_chart(
+                price_chart(history, ticker_for_analysis),
+                use_container_width=True,
             )
 
-            st.success("Raport został zapisany.")
+            close = history["Close"]
+
+            s1, s2, s3, s4 = st.columns(4)
+
+            s1.metric("Średnia cena", f"{close.mean():,.2f}")
+            s2.metric("Minimum", f"{close.min():,.2f}")
+            s3.metric("Maksimum", f"{close.max():,.2f}")
+            s4.metric("Odchylenie standardowe", f"{close.std():,.2f}")
+
+            change = close.iloc[-1] - close.iloc[0]
+            change_percent = change / close.iloc[0] * 100
+
+            st.metric(
+                "Zmiana w analizowanym okresie",
+                f"{change:,.2f}",
+                f"{change_percent:,.2f}%",
+            )
+
+
+# ==========================================================
+# TAB 4 — PORÓWNANIE SPÓŁEK
+# ==========================================================
+
+with tab4:
+    st.subheader("Porównanie historyczne spółek")
+
+    if transactions.empty:
+        st.info("Najpierw dodaj przynajmniej jedną transakcję.")
+    else:
+        compare_tickers = st.multiselect(
+            "Wybierz tickery",
+            sorted(transactions["ticker"].unique().tolist()),
+            default=sorted(transactions["ticker"].unique().tolist())[:3],
+        )
+
+        compare_period = st.selectbox(
+            "Zakres porównania",
+            ["1mo", "3mo", "6mo", "1y", "2y", "5y"],
+            index=3,
+            key="compare_period",
+        )
+
+        if compare_tickers:
+            st.plotly_chart(
+                comparison_chart(compare_tickers, compare_period),
+                use_container_width=True,
+            )
+        else:
+            st.info("Wybierz co najmniej jeden ticker.")
+
+
+# ==========================================================
+# TAB 5 — HISTORIA TRANSAKCJI
+# ==========================================================
+
+with tab5:
+    st.subheader("Historia transakcji")
+
+    if transactions.empty:
+        st.info("Brak zapisanych transakcji.")
+    else:
+        show_df = transactions.copy()
+
+        show_df["transaction_type"] = show_df["transaction_type"].replace(
+            {
+                "buy": "kupno",
+                "sell": "sprzedaż",
+            }
+        )
+
+        st.dataframe(
+            show_df,
+            use_container_width=True,
+        )
+
+        st.subheader("Usuwanie transakcji")
+
+        transaction_ids = transactions["id"].tolist()
+
+        selected_id = st.selectbox(
+            "Wybierz ID transakcji do usunięcia",
+            transaction_ids,
+        )
+
+        if st.button("Usuń wybraną transakcję"):
+            delete_transaction(user_id, selected_id)
+
+            st.success("Transakcja została usunięta.")
             st.rerun()
 
-    with col_b:
-        st.download_button(
-            label="Pobierz raport TXT",
-            data=report_content,
-            file_name="raport_portfela.txt",
-            mime="text/plain",
+
+# ==========================================================
+# TAB 6 — RAPORTY
+# ==========================================================
+
+with tab6:
+    st.subheader("Raporty")
+
+    if transactions.empty:
+        st.info("Brak danych do wygenerowania raportu.")
+    else:
+        report_content = build_report_text(
+            username=username,
+            portfolio=portfolio,
+            transactions=transactions,
         )
+
+        st.text_area(
+            "Podgląd raportu",
+            report_content,
+            height=420,
+        )
+
+        col_a, col_b = st.columns(2)
+
+        with col_a:
+            if st.button("Zapisz raport do historii"):
+                title = f"Raport portfela - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+
+                save_report(
+                    user_id,
+                    title,
+                    report_content,
+                )
+
+                st.success("Raport został zapisany.")
+                st.rerun()
+
+        with col_b:
+            st.download_button(
+                label="Pobierz raport TXT",
+                data=report_content,
+                file_name="raport_portfela.txt",
+                mime="text/plain",
+            )
 
     st.divider()
 
@@ -1131,22 +1212,29 @@ with tab5:
                 st.text(row["content"])
 
 
-with tab6:
+# ==========================================================
+# TAB 7 — EKSPORT I INFORMACJE
+# ==========================================================
+
+with tab7:
     st.subheader("Eksport danych")
 
-    st.download_button(
-        label="Pobierz transakcje CSV",
-        data=transactions.to_csv(index=False).encode("utf-8"),
-        file_name="transactions_export.csv",
-        mime="text/csv",
-    )
+    if transactions.empty:
+        st.info("Brak danych do eksportu.")
+    else:
+        st.download_button(
+            label="Pobierz transakcje CSV",
+            data=transactions.to_csv(index=False).encode("utf-8"),
+            file_name="transactions_export.csv",
+            mime="text/csv",
+        )
 
-    st.download_button(
-        label="Pobierz podsumowanie portfela CSV",
-        data=portfolio.to_csv(index=False).encode("utf-8"),
-        file_name="portfolio_summary.csv",
-        mime="text/csv",
-    )
+        st.download_button(
+            label="Pobierz podsumowanie portfela CSV",
+            data=portfolio.to_csv(index=False).encode("utf-8"),
+            file_name="portfolio_summary.csv",
+            mime="text/csv",
+        )
 
     st.divider()
 
@@ -1156,11 +1244,11 @@ with tab6:
         """
         Aplikacja została przygotowana jako prototyp systemu wspomagającego analizę inwestycji giełdowych.
 
-        **Zakres zgodny z SRS:**
+        **Zakres funkcji:**
         - rejestracja i logowanie użytkownika,
         - bezpieczne przechowywanie haseł w postaci hasha,
         - zapis transakcji kupna i sprzedaży,
-        - import danych z pliku CSV,
+        - automatyczne pobieranie ceny po wpisaniu tickera,
         - analiza średniej ceny zakupu,
         - obliczanie zysku lub straty,
         - ranking najbardziej opłacalnych walorów,
@@ -1168,14 +1256,15 @@ with tab6:
         - porównanie spółek,
         - generowanie raportów,
         - zapis historii raportów,
-        - eksport danych.
+        - eksport danych,
+        - usunięcie konta użytkownika.
 
         **Źródło danych:**
         Aplikacja korzysta z danych online pobieranych za pomocą biblioteki `yfinance`.
-        Dane z serwisów zewnętrznych, takich jak analizy.pl, mogą być wprowadzane ręcznie przez plik CSV.
+        Dane z innych źródeł, takich jak analizy.pl, mogą być wykorzystane po ręcznym przygotowaniu danych.
 
         **Zastrzeżenie:**
         System ma charakter informacyjny i edukacyjny.
-        Nie jest narzędziem doradztwa inwestycyjnego.
+        Nie jest narzędziem doradztwa inwestycyjnego ani rekomendacją inwestycyjną.
         """
     )
