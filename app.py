@@ -48,7 +48,7 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
+            user_id INTEGER,
             trade_date TEXT NOT NULL,
             ticker TEXT NOT NULL,
             transaction_type TEXT NOT NULL,
@@ -70,6 +70,12 @@ def init_db():
         )
         """
     )
+
+    # Migracja na wypadek starej bazy, w której tabela transactions nie miała user_id
+    columns = pd.read_sql_query("PRAGMA table_info(transactions)", conn)
+
+    if not columns.empty and "user_id" not in columns["name"].tolist():
+        conn.execute("ALTER TABLE transactions ADD COLUMN user_id INTEGER DEFAULT 1")
 
     conn.commit()
     conn.close()
@@ -435,6 +441,48 @@ def delete_transaction(user_id: int, row_id: int):
     conn.close()
 
 
+def import_csv_transactions(user_id: int, df: pd.DataFrame):
+    required = {
+        "trade_date",
+        "ticker",
+        "transaction_type",
+        "quantity",
+        "price",
+        "fee",
+    }
+
+    if not required.issubset(df.columns):
+        raise ValueError(
+            "CSV musi zawierać kolumny: "
+            "trade_date, ticker, transaction_type, quantity, price, fee"
+        )
+
+    clean = df.copy()
+
+    clean["trade_date"] = pd.to_datetime(clean["trade_date"]).dt.date
+    clean["ticker"] = clean["ticker"].astype(str).str.upper().str.strip()
+    clean["transaction_type"] = clean["transaction_type"].apply(normalize_transaction_type)
+    clean["quantity"] = pd.to_numeric(clean["quantity"])
+    clean["price"] = pd.to_numeric(clean["price"])
+    clean["fee"] = pd.to_numeric(clean["fee"]).fillna(0)
+
+    added = 0
+
+    for _, row in clean.iterrows():
+        insert_transaction(
+            user_id=user_id,
+            trade_date=row["trade_date"],
+            ticker=row["ticker"],
+            transaction_type=row["transaction_type"],
+            quantity=row["quantity"],
+            price=row["price"],
+            fee=row["fee"],
+        )
+        added += 1
+
+    return added
+
+
 # ==========================================================
 # OBLICZENIA PORTFELA
 # ==========================================================
@@ -734,7 +782,7 @@ st.title("📈 Aplikacja wspomagająca inwestycje giełdowe")
 
 with st.sidebar:
     st.header("Panel użytkownika")
-    st.write(f"Zalogowano jako:")
+    st.write("Zalogowano jako:")
     st.subheader(username)
 
     if st.button("Wyloguj"):
@@ -787,12 +835,13 @@ else:
 # ZAKŁADKI
 # ==========================================================
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
     [
         "Portfel",
         "Dodaj transakcję",
         "Analiza spółki",
         "Porównanie spółek",
+        "Wykresy",
         "Historia transakcji",
         "Raporty",
         "Eksport i informacje",
@@ -828,25 +877,6 @@ with tab1:
             use_container_width=True,
         )
 
-        chart_col1, chart_col2 = st.columns(2)
-
-        with chart_col1:
-            st.plotly_chart(
-                profit_chart(portfolio),
-                use_container_width=True,
-            )
-
-        with chart_col2:
-            fig = allocation_chart(portfolio)
-
-            if fig:
-                st.plotly_chart(
-                    fig,
-                    use_container_width=True,
-                )
-            else:
-                st.info("Brak aktywnych pozycji do pokazania struktury portfela.")
-
         st.subheader("Ranking opłacalności")
 
         ranking = portfolio[
@@ -872,16 +902,33 @@ with tab1:
 
         selected_row = portfolio[portfolio["Ticker"] == selected_ticker].iloc[0]
 
-        default_price = (
-            float(selected_row["Aktualny kurs"])
-            if pd.notna(selected_row["Aktualny kurs"])
-            else 100.0
-        )
+        latest_price, latest_date, source = get_latest_market_price(selected_ticker)
+
+        if latest_price is not None:
+            if latest_date is not None and hasattr(latest_date, "strftime"):
+                date_text = latest_date.strftime("%Y-%m-%d")
+            else:
+                date_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            st.info(
+                f"Aktualny kurs sprzedaży dla {selected_ticker}: "
+                f"{latest_price:,.2f} | źródło: {source} | data: {date_text}"
+            )
+
+            default_price = float(latest_price)
+        else:
+            st.warning("Nie udało się pobrać aktualnego kursu. Wpisz cenę ręcznie.")
+
+            default_price = (
+                float(selected_row["Aktualny kurs"])
+                if pd.notna(selected_row["Aktualny kurs"])
+                else 100.0
+            )
 
         target_price = st.number_input(
-            "Założona cena sprzedaży",
+            "Cena sprzedaży",
             min_value=0.0,
-            value=default_price,
+            value=round(default_price, 2),
             step=0.01,
         )
 
@@ -897,7 +944,7 @@ with tab1:
         ) * quantity_to_sell
 
         st.metric(
-            "Szacowany zysk/strata",
+            "Szacowany zysk/strata ze sprzedaży",
             f"{estimated_pl:,.2f}",
         )
 
@@ -1114,16 +1161,48 @@ with tab4:
 
 
 # ==========================================================
-# TAB 5 — HISTORIA TRANSAKCJI
+# TAB 5 — WYKRESY
 # ==========================================================
 
 with tab5:
+    st.subheader("Wykresy portfela")
+
+    if transactions.empty:
+        st.info("Brak danych do wygenerowania wykresów.")
+    else:
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.plotly_chart(
+                profit_chart(portfolio),
+                use_container_width=True,
+            )
+
+        with col2:
+            fig = allocation_chart(portfolio)
+
+            if fig:
+                st.plotly_chart(
+                    fig,
+                    use_container_width=True,
+                )
+            else:
+                st.info("Brak aktywnych pozycji do pokazania struktury portfela.")
+
+
+# ==========================================================
+# TAB 6 — HISTORIA TRANSAKCJI
+# ==========================================================
+
+with tab6:
     st.subheader("Historia transakcji")
 
     if transactions.empty:
         st.info("Brak zapisanych transakcji.")
     else:
         show_df = transactions.copy()
+
+        show_df.insert(0, "Lp.", range(1, len(show_df) + 1))
 
         show_df["transaction_type"] = show_df["transaction_type"].replace(
             {
@@ -1132,18 +1211,40 @@ with tab5:
             }
         )
 
+        display_history = show_df[
+            [
+                "Lp.",
+                "trade_date",
+                "ticker",
+                "transaction_type",
+                "quantity",
+                "price",
+                "fee",
+            ]
+        ]
+
         st.dataframe(
-            show_df,
+            display_history,
             use_container_width=True,
         )
 
         st.subheader("Usuwanie transakcji")
 
-        transaction_ids = transactions["id"].tolist()
+        transaction_options = show_df[["Lp.", "id", "ticker", "trade_date"]].copy()
+        transaction_options["opis"] = transaction_options.apply(
+            lambda row: f'{row["Lp."]}. {row["ticker"]} — {row["trade_date"].strftime("%Y-%m-%d")} — ID {row["id"]}',
+            axis=1,
+        )
 
-        selected_id = st.selectbox(
-            "Wybierz ID transakcji do usunięcia",
-            transaction_ids,
+        selected_description = st.selectbox(
+            "Wybierz transakcję do usunięcia",
+            transaction_options["opis"].tolist(),
+        )
+
+        selected_id = int(
+            transaction_options[
+                transaction_options["opis"] == selected_description
+            ]["id"].iloc[0]
         )
 
         if st.button("Usuń wybraną transakcję"):
@@ -1154,10 +1255,10 @@ with tab5:
 
 
 # ==========================================================
-# TAB 6 — RAPORTY
+# TAB 7 — RAPORTY
 # ==========================================================
 
-with tab6:
+with tab7:
     st.subheader("Raporty")
 
     if transactions.empty:
@@ -1213,10 +1314,46 @@ with tab6:
 
 
 # ==========================================================
-# TAB 7 — EKSPORT I INFORMACJE
+# TAB 8 — EKSPORT I INFORMACJE
 # ==========================================================
 
-with tab7:
+with tab8:
+    st.subheader("Import danych z CSV")
+
+    st.markdown(
+        """
+        Możesz wgrać plik CSV z transakcjami, np. przygotowany ręcznie albo na podstawie danych zewnętrznych.
+        """
+    )
+
+    uploaded_csv = st.file_uploader(
+        "Wgraj plik CSV z transakcjami",
+        type=["csv"],
+        key="csv_import_export_tab",
+    )
+
+    if uploaded_csv is not None:
+        if st.button("Importuj transakcje z CSV"):
+            try:
+                csv_df = pd.read_csv(uploaded_csv)
+                count = import_csv_transactions(user_id, csv_df)
+
+                st.success(f"Zaimportowano transakcje: {count}")
+                st.rerun()
+
+            except Exception as exc:
+                st.error(str(exc))
+
+    with st.expander("Wymagany format CSV"):
+        st.code(
+            """trade_date,ticker,transaction_type,quantity,price,fee
+2026-03-01,AAPL,buy,10,210.50,2.99
+2026-03-15,AAPL,sell,3,219.80,2.99""",
+            language="csv",
+        )
+
+    st.divider()
+
     st.subheader("Eksport danych")
 
     if transactions.empty:
@@ -1249,6 +1386,7 @@ with tab7:
         - bezpieczne przechowywanie haseł w postaci hasha,
         - zapis transakcji kupna i sprzedaży,
         - automatyczne pobieranie ceny po wpisaniu tickera,
+        - import transakcji z pliku CSV,
         - analiza średniej ceny zakupu,
         - obliczanie zysku lub straty,
         - ranking najbardziej opłacalnych walorów,
@@ -1261,7 +1399,7 @@ with tab7:
 
         **Źródło danych:**
         Aplikacja korzysta z danych online pobieranych za pomocą biblioteki `yfinance`.
-        Dane z innych źródeł, takich jak analizy.pl, mogą być wykorzystane po ręcznym przygotowaniu danych.
+        Dane z innych źródeł, takich jak analizy.pl, mogą być wykorzystane po ręcznym przygotowaniu danych w pliku CSV.
 
         **Zastrzeżenie:**
         System ma charakter informacyjny i edukacyjny.
