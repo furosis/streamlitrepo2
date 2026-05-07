@@ -70,7 +70,7 @@ def init_db():
         """
     )
 
-    # Prosta migracja na wypadek, gdyby wcześniej istniała tabela bez user_id
+    # Migracja na wypadek, gdyby wcześniej istniała tabela bez user_id
     columns = pd.read_sql_query("PRAGMA table_info(transactions)", conn)
     if "user_id" not in columns["name"].tolist():
         conn.execute("ALTER TABLE transactions ADD COLUMN user_id INTEGER DEFAULT 1")
@@ -85,12 +85,14 @@ def init_db():
 
 def hash_password(password: str) -> str:
     salt = os.urandom(16)
+
     password_hash = hashlib.pbkdf2_hmac(
         "sha256",
         password.encode("utf-8"),
         salt,
         120_000,
     )
+
     return (
         base64.b64encode(salt).decode("utf-8")
         + ":"
@@ -110,7 +112,9 @@ def verify_password(password: str, stored_hash: str) -> bool:
             salt,
             120_000,
         )
+
         return test_hash == correct_hash
+
     except Exception:
         return False
 
@@ -125,17 +129,24 @@ def register_user(username: str, password: str):
         raise ValueError("Hasło musi mieć co najmniej 5 znaków.")
 
     conn = get_connection()
+
     try:
         conn.execute(
             """
             INSERT INTO users (username, password_hash, created_at)
             VALUES (?, ?, ?)
             """,
-            (username, hash_password(password), datetime.now().isoformat(timespec="seconds")),
+            (
+                username,
+                hash_password(password),
+                datetime.now().isoformat(timespec="seconds"),
+            ),
         )
         conn.commit()
+
     except sqlite3.IntegrityError:
         raise ValueError("Taki użytkownik już istnieje.")
+
     finally:
         conn.close()
 
@@ -144,10 +155,12 @@ def login_user(username: str, password: str):
     username = username.strip().lower()
 
     conn = get_connection()
+
     row = conn.execute(
         "SELECT id, username, password_hash FROM users WHERE username = ?",
         (username,),
     ).fetchone()
+
     conn.close()
 
     if row is None:
@@ -156,26 +169,34 @@ def login_user(username: str, password: str):
     user_id, username_db, password_hash = row
 
     if verify_password(password, password_hash):
-        return {"id": user_id, "username": username_db}
+        return {
+            "id": user_id,
+            "username": username_db,
+        }
 
     return None
 
 
 def show_login_screen():
     st.title("📈 Aplikacja wspomagająca inwestycje giełdowe")
-    st.caption("System analityczny do obsługi portfela inwestycyjnego, transakcji, raportów i wykresów.")
+    st.caption(
+        "System analityczny do obsługi portfela inwestycyjnego, transakcji, raportów i wykresów."
+    )
 
     left, right = st.columns([1, 1])
 
     with left:
         st.subheader("Logowanie")
+
         with st.form("login_form"):
             username = st.text_input("Nazwa użytkownika")
             password = st.text_input("Hasło", type="password")
+
             submitted = st.form_submit_button("Zaloguj")
 
             if submitted:
                 user = login_user(username, password)
+
                 if user:
                     st.session_state["user_id"] = user["id"]
                     st.session_state["username"] = user["username"]
@@ -186,9 +207,11 @@ def show_login_screen():
 
     with right:
         st.subheader("Rejestracja")
+
         with st.form("register_form"):
             new_username = st.text_input("Nowa nazwa użytkownika")
             new_password = st.text_input("Nowe hasło", type="password")
+
             submitted = st.form_submit_button("Utwórz konto")
 
             if submitted:
@@ -199,6 +222,7 @@ def show_login_screen():
                     st.error(str(exc))
 
     st.divider()
+
     st.info(
         "Hasła są zapisywane w bazie SQLite jako hash PBKDF2-HMAC-SHA256 z losową solą. "
         "Aplikacja nie przechowuje haseł w postaci jawnej."
@@ -206,67 +230,38 @@ def show_login_screen():
 
 
 # ==========================================================
-# DANE RYNKOWE
+# DANE RYNKOWE — YFINANCE
 # ==========================================================
 
 @st.cache_data(ttl=1800)
-def load_price_history_online(ticker: str, period: str = "1y") -> pd.DataFrame:
+def load_price_history(ticker: str, period: str = "1y") -> pd.DataFrame:
+    """
+    Pobiera dane historyczne z Yahoo Finance za pomocą biblioteki yfinance.
+    Dane są wykorzystywane do wykresów, porównań oraz wyceny portfela.
+    """
+
     try:
-        data = yf.Ticker(ticker).history(period=period, auto_adjust=True)
+        ticker = ticker.upper().strip()
+
+        data = yf.Ticker(ticker).history(
+            period=period,
+            auto_adjust=True,
+        )
+
         if data.empty:
             return pd.DataFrame()
 
         data = data.reset_index()
-        data["Date"] = pd.to_datetime(data["Date"]).dt.tz_localize(None)
+
+        if "Date" in data.columns:
+            data["Date"] = pd.to_datetime(data["Date"]).dt.tz_localize(None)
+        elif "Datetime" in data.columns:
+            data["Date"] = pd.to_datetime(data["Datetime"]).dt.tz_localize(None)
+
         return data
+
     except Exception:
         return pd.DataFrame()
-
-
-def generate_demo_history(ticker: str, period: str = "1y") -> pd.DataFrame:
-    period_days = {
-        "1mo": 30,
-        "3mo": 90,
-        "6mo": 180,
-        "1y": 365,
-        "2y": 730,
-        "5y": 1825,
-    }
-
-    days = period_days.get(period, 365)
-    dates = pd.date_range(end=pd.Timestamp.today().normalize(), periods=days, freq="D")
-
-    seed = sum(ord(c) for c in ticker.upper())
-    rng = np.random.default_rng(seed)
-
-    base = 60 + (seed % 180)
-    trend = np.linspace(0, rng.uniform(-15, 25), days)
-    noise = rng.normal(0, 2.5, days).cumsum()
-    seasonal = np.sin(np.linspace(0, 8 * np.pi, days)) * rng.uniform(2, 8)
-
-    close = base + trend + noise + seasonal
-    close = np.maximum(close, 5)
-
-    return pd.DataFrame(
-        {
-            "Date": dates,
-            "Close": close,
-        }
-    )
-
-
-def load_price_history(ticker: str, period: str = "1y", data_mode: str = "online") -> pd.DataFrame:
-    ticker = ticker.upper().strip()
-
-    if data_mode == "demo":
-        return generate_demo_history(ticker, period)
-
-    online_data = load_price_history_online(ticker, period)
-
-    if online_data.empty:
-        return generate_demo_history(ticker, period)
-
-    return online_data
 
 
 # ==========================================================
@@ -305,6 +300,7 @@ def insert_transaction(user_id, trade_date, ticker, transaction_type, quantity, 
         raise ValueError("Prowizja nie może być ujemna.")
 
     conn = get_connection()
+
     conn.execute(
         """
         INSERT INTO transactions
@@ -321,12 +317,14 @@ def insert_transaction(user_id, trade_date, ticker, transaction_type, quantity, 
             float(fee),
         ),
     )
+
     conn.commit()
     conn.close()
 
 
 def read_transactions(user_id: int) -> pd.DataFrame:
     conn = get_connection()
+
     df = pd.read_sql_query(
         """
         SELECT id, trade_date, ticker, transaction_type, quantity, price, fee
@@ -337,45 +335,70 @@ def read_transactions(user_id: int) -> pd.DataFrame:
         conn,
         params=(int(user_id),),
     )
+
     conn.close()
 
     if df.empty:
         return pd.DataFrame(
-            columns=["id", "trade_date", "ticker", "transaction_type", "quantity", "price", "fee"]
+            columns=[
+                "id",
+                "trade_date",
+                "ticker",
+                "transaction_type",
+                "quantity",
+                "price",
+                "fee",
+            ]
         )
 
     df["trade_date"] = pd.to_datetime(df["trade_date"])
     df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
+
     return df
 
 
 def delete_transaction(user_id: int, row_id: int):
     conn = get_connection()
+
     conn.execute(
         "DELETE FROM transactions WHERE id = ? AND user_id = ?",
-        (int(row_id), int(user_id)),
+        (
+            int(row_id),
+            int(user_id),
+        ),
     )
+
     conn.commit()
     conn.close()
 
 
 def delete_all_transactions(user_id: int):
     conn = get_connection()
+
     conn.execute(
         "DELETE FROM transactions WHERE user_id = ?",
         (int(user_id),),
     )
+
     conn.commit()
     conn.close()
 
 
 def import_csv_transactions(user_id: int, df: pd.DataFrame):
-    required = {"trade_date", "ticker", "transaction_type", "quantity", "price", "fee"}
+    required = {
+        "trade_date",
+        "ticker",
+        "transaction_type",
+        "quantity",
+        "price",
+        "fee",
+    }
 
     if not required.issubset(df.columns):
         raise ValueError(f"CSV musi zawierać kolumny: {', '.join(sorted(required))}")
 
     clean = df.copy()
+
     clean["trade_date"] = pd.to_datetime(clean["trade_date"]).dt.date
     clean["ticker"] = clean["ticker"].astype(str).str.upper().str.strip()
     clean["transaction_type"] = clean["transaction_type"].apply(normalize_transaction_type)
@@ -395,13 +418,14 @@ def import_csv_transactions(user_id: int, df: pd.DataFrame):
             price=row["price"],
             fee=row["fee"],
         )
+
         added += 1
 
     return added
 
 
 # ==========================================================
-# PRZYKŁADOWA WIĘKSZA BAZA
+# WIĘKSZA PRZYKŁADOWA BAZA TRANSAKCJI
 # ==========================================================
 
 DEMO_TRANSACTIONS = [
@@ -463,7 +487,7 @@ def load_demo_transactions(user_id: int):
 # OBLICZENIA PORTFELA
 # ==========================================================
 
-def calculate_portfolio(transactions: pd.DataFrame, data_mode: str) -> pd.DataFrame:
+def calculate_portfolio(transactions: pd.DataFrame) -> pd.DataFrame:
     if transactions.empty:
         return pd.DataFrame()
 
@@ -487,14 +511,19 @@ def calculate_portfolio(transactions: pd.DataFrame, data_mode: str) -> pd.DataFr
 
         realized_pl = gross_sell_value - sell_fees - (avg_buy_price * sold_qty)
 
-        history = load_price_history(ticker, period="5d", data_mode=data_mode)
+        history = load_price_history(ticker, period="5d")
 
-        if not history.empty:
+        if not history.empty and "Close" in history.columns:
             market_price = float(history["Close"].iloc[-1])
             market_value = current_qty * market_price
             unrealized_pl = market_value - (current_qty * avg_buy_price)
             total_pl = realized_pl + unrealized_pl
-            profit_percent = (total_pl / (gross_buy_value + buy_fees) * 100) if gross_buy_value > 0 else 0
+
+            profit_percent = (
+                total_pl / (gross_buy_value + buy_fees) * 100
+                if gross_buy_value > 0
+                else 0
+            )
         else:
             market_price = np.nan
             market_value = np.nan
@@ -529,6 +558,7 @@ def calculate_portfolio(transactions: pd.DataFrame, data_mode: str) -> pd.DataFr
 
 def price_chart(history_df: pd.DataFrame, ticker: str):
     fig = go.Figure()
+
     fig.add_trace(
         go.Scatter(
             x=history_df["Date"],
@@ -537,6 +567,7 @@ def price_chart(history_df: pd.DataFrame, ticker: str):
             name="Cena zamknięcia",
         )
     )
+
     fig.update_layout(
         title=f"Notowania {ticker}",
         xaxis_title="Data",
@@ -544,16 +575,17 @@ def price_chart(history_df: pd.DataFrame, ticker: str):
         height=450,
         margin=dict(l=20, r=20, t=50, b=20),
     )
+
     return fig
 
 
-def comparison_chart(tickers: list[str], period: str, data_mode: str):
+def comparison_chart(tickers: list[str], period: str):
     fig = go.Figure()
 
     for ticker in tickers:
-        history = load_price_history(ticker, period=period, data_mode=data_mode)
+        history = load_price_history(ticker, period=period)
 
-        if history.empty:
+        if history.empty or "Close" not in history.columns:
             continue
 
         normalized = history["Close"] / history["Close"].iloc[0] * 100
@@ -629,7 +661,7 @@ def profit_chart(portfolio: pd.DataFrame):
 # RAPORTY
 # ==========================================================
 
-def build_report_text(username: str, portfolio: pd.DataFrame, transactions: pd.DataFrame, data_mode: str) -> str:
+def build_report_text(username: str, portfolio: pd.DataFrame, transactions: pd.DataFrame) -> str:
     if portfolio.empty:
         return "Brak danych do wygenerowania raportu."
 
@@ -647,7 +679,7 @@ RAPORT ANALIZY PORTFELA INWESTYCYJNEGO
 
 Użytkownik: {username}
 Data wygenerowania raportu: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-Tryb danych rynkowych: {data_mode}
+Źródło danych rynkowych: yfinance / Yahoo Finance
 
 1. PODSUMOWANIE OGÓLNE
 
@@ -685,6 +717,7 @@ Aplikacja nie stanowi systemu doradztwa inwestycyjnego ani rekomendacji kupna lu
 
 def save_report(user_id: int, title: str, content: str):
     conn = get_connection()
+
     conn.execute(
         """
         INSERT INTO reports (user_id, created_at, title, content)
@@ -697,12 +730,14 @@ def save_report(user_id: int, title: str, content: str):
             content,
         ),
     )
+
     conn.commit()
     conn.close()
 
 
 def read_reports(user_id: int) -> pd.DataFrame:
     conn = get_connection()
+
     df = pd.read_sql_query(
         """
         SELECT id, created_at, title, content
@@ -713,7 +748,9 @@ def read_reports(user_id: int) -> pd.DataFrame:
         conn,
         params=(int(user_id),),
     )
+
     conn.close()
+
     return df
 
 
@@ -736,20 +773,9 @@ st.caption(f"Zalogowany użytkownik: **{username}**")
 with st.sidebar:
     st.header("Panel użytkownika")
 
-    data_mode_label = st.radio(
-        "Źródło danych rynkowych",
-        [
-            "Online: yfinance",
-            "Demo: dane przykładowe",
-        ],
-        index=0,
-    )
-
-    data_mode = "online" if data_mode_label.startswith("Online") else "demo"
-
     st.info(
-        "W wersji prototypowej dane mogą pochodzić z serwisu online albo z danych demonstracyjnych. "
-        "Import z analizy.pl może być realizowany przez plik CSV przygotowany przez użytkownika."
+        "Aplikacja pobiera dane rynkowe online za pomocą biblioteki yfinance. "
+        "Dane z innych źródeł, np. analizy.pl, mogą być wprowadzane przez plik CSV."
     )
 
     if st.button("Wyloguj"):
@@ -781,8 +807,10 @@ with st.sidebar:
                     price=price,
                     fee=fee,
                 )
+
                 st.success("Transakcja została dodana.")
                 st.rerun()
+
             except Exception as exc:
                 st.error(str(exc))
 
@@ -797,8 +825,10 @@ with st.sidebar:
             try:
                 csv_df = pd.read_csv(uploaded)
                 count = import_csv_transactions(user_id, csv_df)
+
                 st.success(f"Zaimportowano transakcje: {count}")
                 st.rerun()
+
             except Exception as exc:
                 st.error(str(exc))
 
@@ -817,23 +847,28 @@ with st.sidebar:
     if st.button("Załaduj większą przykładową bazę"):
         try:
             load_demo_transactions(user_id)
+
             st.success("Przykładowa baza została załadowana.")
             st.rerun()
+
         except Exception as exc:
             st.error(str(exc))
 
     if st.button("Usuń wszystkie moje transakcje"):
         delete_all_transactions(user_id)
+
         st.warning("Usunięto wszystkie transakcje użytkownika.")
         st.rerun()
 
 
 transactions = read_transactions(user_id)
-portfolio = calculate_portfolio(transactions, data_mode=data_mode)
+portfolio = calculate_portfolio(transactions)
 
 
 if transactions.empty:
-    st.info("Dodaj pierwszą transakcję z panelu po lewej, zaimportuj CSV albo załaduj większą przykładową bazę.")
+    st.info(
+        "Dodaj pierwszą transakcję z panelu po lewej, zaimportuj CSV albo załaduj większą przykładową bazę."
+    )
     st.stop()
 
 
@@ -847,6 +882,7 @@ total_pl = np.nansum(portfolio["Łączny P/L"]) if not portfolio.empty else 0
 best_ticker = portfolio.iloc[0]["Ticker"] if not portfolio.empty else "-"
 
 c1, c2, c3, c4 = st.columns(4)
+
 c1.metric("Łączny koszt zakupu", f"{total_cost:,.2f}")
 c2.metric("Aktualna wartość", f"{total_market_value:,.2f}")
 c3.metric("Łączny P/L", f"{total_pl:,.2f}")
@@ -893,24 +929,40 @@ with tab1:
 
     with chart_col2:
         fig = allocation_chart(portfolio)
+
         if fig:
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("Brak aktywnych pozycji do pokazania struktury portfela.")
 
     st.subheader("Ranking opłacalności")
-    ranking = portfolio[["Ticker", "Łączny P/L", "Stopa zwrotu [%]", "Wartość rynkowa"]].copy()
+
+    ranking = portfolio[
+        [
+            "Ticker",
+            "Łączny P/L",
+            "Stopa zwrotu [%]",
+            "Wartość rynkowa",
+        ]
+    ].copy()
+
     st.dataframe(ranking, use_container_width=True)
 
     st.subheader("Kalkulator sprzedaży")
 
-    selected_ticker = st.selectbox("Wybierz ticker", portfolio["Ticker"].tolist())
+    selected_ticker = st.selectbox(
+        "Wybierz ticker",
+        portfolio["Ticker"].tolist(),
+    )
+
     selected_row = portfolio[portfolio["Ticker"] == selected_ticker].iloc[0]
 
     target_price = st.number_input(
         "Założona cena sprzedaży",
         min_value=0.0,
-        value=float(selected_row["Aktualny kurs"]) if pd.notna(selected_row["Aktualny kurs"]) else 100.0,
+        value=float(selected_row["Aktualny kurs"])
+        if pd.notna(selected_row["Aktualny kurs"])
+        else 100.0,
         step=0.01,
     )
 
@@ -922,6 +974,7 @@ with tab1:
     )
 
     estimated_pl = (target_price - selected_row["Średnia cena zakupu"]) * quantity_to_sell
+
     st.metric("Szacowany zysk/strata", f"{estimated_pl:,.2f}")
 
 
@@ -930,7 +983,11 @@ with tab2:
 
     all_tickers = sorted(transactions["ticker"].unique().tolist())
 
-    ticker_for_analysis = st.selectbox("Spółka", all_tickers, key="analysis_ticker")
+    ticker_for_analysis = st.selectbox(
+        "Spółka",
+        all_tickers,
+        key="analysis_ticker",
+    )
 
     period = st.selectbox(
         "Zakres danych",
@@ -938,16 +995,20 @@ with tab2:
         index=3,
     )
 
-    history = load_price_history(ticker_for_analysis, period=period, data_mode=data_mode)
+    history = load_price_history(ticker_for_analysis, period=period)
 
     if history.empty:
-        st.warning("Brak danych dla wybranego tickera.")
+        st.warning("Brak danych dla wybranego tickera. Sprawdź symbol spółki.")
     else:
-        st.plotly_chart(price_chart(history, ticker_for_analysis), use_container_width=True)
+        st.plotly_chart(
+            price_chart(history, ticker_for_analysis),
+            use_container_width=True,
+        )
 
         close = history["Close"]
 
         s1, s2, s3, s4 = st.columns(4)
+
         s1.metric("Średnia cena", f"{close.mean():,.2f}")
         s2.metric("Minimum", f"{close.min():,.2f}")
         s3.metric("Maksimum", f"{close.max():,.2f}")
@@ -981,7 +1042,7 @@ with tab3:
 
     if compare_tickers:
         st.plotly_chart(
-            comparison_chart(compare_tickers, compare_period, data_mode),
+            comparison_chart(compare_tickers, compare_period),
             use_container_width=True,
         )
     else:
@@ -992,8 +1053,12 @@ with tab4:
     st.subheader("Historia transakcji")
 
     show_df = transactions.copy()
+
     show_df["transaction_type"] = show_df["transaction_type"].replace(
-        {"buy": "kupno", "sell": "sprzedaż"}
+        {
+            "buy": "kupno",
+            "sell": "sprzedaż",
+        }
     )
 
     st.dataframe(show_df, use_container_width=True)
@@ -1002,10 +1067,14 @@ with tab4:
 
     transaction_ids = transactions["id"].tolist()
 
-    selected_id = st.selectbox("Wybierz ID transakcji do usunięcia", transaction_ids)
+    selected_id = st.selectbox(
+        "Wybierz ID transakcji do usunięcia",
+        transaction_ids,
+    )
 
     if st.button("Usuń wybraną transakcję"):
         delete_transaction(user_id, selected_id)
+
         st.success("Transakcja została usunięta.")
         st.rerun()
 
@@ -1017,17 +1086,26 @@ with tab5:
         username=username,
         portfolio=portfolio,
         transactions=transactions,
-        data_mode=data_mode,
     )
 
-    st.text_area("Podgląd raportu", report_content, height=420)
+    st.text_area(
+        "Podgląd raportu",
+        report_content,
+        height=420,
+    )
 
     col_a, col_b = st.columns(2)
 
     with col_a:
         if st.button("Zapisz raport do historii"):
             title = f"Raport portfela - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-            save_report(user_id, title, report_content)
+
+            save_report(
+                user_id,
+                title,
+                report_content,
+            )
+
             st.success("Raport został zapisany.")
             st.rerun()
 
@@ -1040,6 +1118,7 @@ with tab5:
         )
 
     st.divider()
+
     st.subheader("Historia zapisanych raportów")
 
     reports = read_reports(user_id)
@@ -1079,6 +1158,7 @@ with tab6:
 
         **Zakres zgodny z SRS:**
         - rejestracja i logowanie użytkownika,
+        - bezpieczne przechowywanie haseł w postaci hasha,
         - zapis transakcji kupna i sprzedaży,
         - import danych z pliku CSV,
         - analiza średniej ceny zakupu,
@@ -1091,11 +1171,11 @@ with tab6:
         - eksport danych.
 
         **Źródło danych:**
-        W wersji prototypowej aplikacja może korzystać z danych online przez bibliotekę `yfinance`
-        albo z danych demonstracyjnych. Dane z serwisów zewnętrznych, takich jak analizy.pl,
-        mogą być importowane ręcznie przez plik CSV.
+        Aplikacja korzysta z danych online pobieranych za pomocą biblioteki `yfinance`.
+        Dane z serwisów zewnętrznych, takich jak analizy.pl, mogą być wprowadzane ręcznie przez plik CSV.
 
         **Zastrzeżenie:**
-        System ma charakter informacyjny i edukacyjny. Nie jest narzędziem doradztwa inwestycyjnego.
+        System ma charakter informacyjny i edukacyjny.
+        Nie jest narzędziem doradztwa inwestycyjnego.
         """
     )
